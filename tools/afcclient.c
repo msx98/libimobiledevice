@@ -44,6 +44,7 @@
 #include <windows.h>
 #include <sys/time.h>
 #include <conio.h>
+#include <sys/utime.h>
 #define sleep(x) Sleep(x*1000)
 #define S_IFMT          0170000         /* [XSI] type of file mask */
 #define S_IFIFO         0010000         /* [XSI] named pipe (fifo) */
@@ -204,6 +205,8 @@ static void handle_help(afc_client_t afc, int argc, char** argv)
 	printf("rm PATH - remove item at PATH\n");
 	printf("get [-rf] PATH [LOCALPATH] - transfer file at PATH from device to LOCALPATH\n");
 	printf("put [-rf] LOCALPATH [PATH] - transfer local file at LOCALPATH to device at PATH\n");
+	printf("rsync REMOTE LOCAL - sync files from device REMOTE path to local LOCAL path,\n");
+	printf("        skipping files that are already up-to-date (same size and mtime)\n");
 	printf("\n");
 }
 
@@ -1090,6 +1093,111 @@ static uint8_t put_file(afc_client_t afc, const char *srcpath, const char *dstpa
 	return 1;
 }
 
+static void rsync_recursive(afc_client_t afc, const char *remote_path, const char *local_path, int dry_run)
+{
+	struct afc_file_stat remote_st;
+	if (get_file_info_stat(afc, remote_path, &remote_st) != 0) {
+		printf("Error: Failed to stat remote path '%s'\n", remote_path);
+		return;
+	}
+
+	if (S_ISDIR(remote_st.st_mode)) {
+		if (!dry_run && !is_directory(local_path)) {
+			if (__mkdir(local_path) != 0) {
+				printf("Error: Failed to create local directory '%s': %s\n", local_path, strerror(errno));
+				return;
+			}
+		}
+		char **entries = NULL;
+		afc_error_t err = afc_read_directory(afc, remote_path, &entries);
+		if (err != AFC_E_SUCCESS) {
+			printf("Error: Failed to list remote directory '%s': %s (%d)\n", remote_path, afc_strerror(err), err);
+			return;
+		}
+		uint8_t remote_is_root = strcmp(remote_path, "/") == 0;
+		char **p = entries;
+		while (p && *p) {
+			if (strcmp(".", *p) == 0 || strcmp("..", *p) == 0) {
+				p++;
+				continue;
+			}
+			size_t new_remote_len = (remote_is_root ? 0 : strlen(remote_path)) + 1 + strlen(*p) + 1;
+			char *new_remote = malloc(new_remote_len);
+			if (remote_is_root) {
+				snprintf(new_remote, new_remote_len, "/%s", *p);
+			} else {
+				snprintf(new_remote, new_remote_len, "%s/%s", remote_path, *p);
+			}
+			size_t new_local_len = strlen(local_path) + 1 + strlen(*p) + 1;
+			char *new_local = malloc(new_local_len);
+			snprintf(new_local, new_local_len, "%s/%s", local_path, *p);
+			rsync_recursive(afc, new_remote, new_local, dry_run);
+			free(new_remote);
+			free(new_local);
+			p++;
+		}
+		afc_dictionary_free(entries);
+	} else if (S_ISREG(remote_st.st_mode)) {
+		struct stat local_st;
+		int local_exists = (lstat(local_path, &local_st) == 0);
+#ifdef _WIN32
+		time_t local_mtime = local_exists ? local_st.st_mtime : 0;
+#else
+		time_t local_mtime = local_exists ? local_st.st_mtimespec.tv_sec : 0;
+#endif
+		if (local_exists && local_mtime >= (time_t)remote_st.st_mtime &&
+		    (uint64_t)local_st.st_size == remote_st.st_size) {
+			return;
+		}
+		printf("%s %s\n", local_exists ? ">f.st......" : ">f+++++++++", local_path);
+		if (!dry_run && get_single_file(afc, remote_path, local_path, remote_st.st_size, 1)) {
+#ifdef _WIN32
+			struct utimbuf times;
+			times.actime = remote_st.st_mtime;
+			times.modtime = remote_st.st_mtime;
+			utime(local_path, &times);
+#else
+			struct timeval times[2];
+			times[0].tv_sec = remote_st.st_mtime;
+			times[0].tv_usec = 0;
+			times[1].tv_sec = remote_st.st_mtime;
+			times[1].tv_usec = 0;
+			utimes(local_path, times);
+#endif
+		}
+	}
+}
+
+static void handle_rsync(afc_client_t afc, int argc, char **argv)
+{
+	int dry_run = 0;
+	int i = 0;
+	for (; i < argc; i++) {
+		if (!strcmp(argv[i], "--dry-run") || !strcmp(argv[i], "-n")) {
+			dry_run = 1;
+		} else {
+			break;
+		}
+	}
+	if (argc - i < 2) {
+		printf("Error: Usage: rsync [--dry-run] REMOTE LOCAL\n");
+		return;
+	}
+
+	char *remote_path = strdup(argv[i]);
+	size_t rlen = strlen(remote_path);
+	if (rlen > 1 && remote_path[rlen - 1] == '/') {
+		remote_path[rlen - 1] = '\0';
+	}
+	char *abs_remote = get_absolute_path(remote_path);
+	free(remote_path);
+
+	const char *local_path = argv[i + 1];
+
+	rsync_recursive(afc, abs_remote, local_path, dry_run);
+	free(abs_remote);
+}
+
 static void handle_put(afc_client_t afc, int argc, char **argv)
 {
 	if (argc < 1) {
@@ -1357,6 +1465,9 @@ static int process_args(afc_client_t afc, int argc, char** argv)
 	else if (!strcmp(argv[0], "put")) {
 		handle_put(afc, argc-1, argv+1);
 	}
+	else if (!strcmp(argv[0], "rsync")) {
+		handle_rsync(afc, argc-1, argv+1);
+	}
 	else if (!strcmp(argv[0], "pwd")) {
 		handle_pwd(afc, argc-1, argv+1);
 	}
@@ -1464,7 +1575,7 @@ int main(int argc, char** argv)
 	signal(SIGPIPE, SIG_IGN);
 #endif
 
-	while ((c = getopt_long(argc, argv, "du:nhv", longopts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "+du:nhv", longopts, NULL)) != -1) {
 		switch (c) {
 		case 'd':
 			idevice_set_debug_level(1);
