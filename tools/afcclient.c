@@ -714,11 +714,37 @@ static uint8_t get_single_file(afc_client_t afc, const char *srcpath, const char
 		printf("Error: Failed to overwrite existing file without '-f' option: %s\n", dstpath);
 		return 0;
 	}
-	FILE *f = fopen(dstpath, "wb");
-	if (!f) {
-		printf("Error: Failed to open local file '%s': %s\n", dstpath, strerror(errno));
+
+	/* Write to a temp file in the same directory, rename into place on success
+	 * so that a failed transfer never leaves a partial file at the destination. */
+	const char *base = path_get_basename(dstpath);
+	size_t dir_len = (size_t)(base - dstpath); /* includes trailing slash */
+	size_t tmp_len = dir_len + 1 + strlen(base) + 7 + 1; /* "." + base + "XXXXXX" */
+	char *tmppath = malloc(tmp_len);
+	if (dir_len > 0) {
+		snprintf(tmppath, tmp_len, "%.*s.%sXXXXXX", (int)dir_len, dstpath, base);
+	} else {
+		snprintf(tmppath, tmp_len, ".%sXXXXXX", base);
+	}
+#ifdef _WIN32
+	if (_mktemp(tmppath) == NULL) {
+		printf("Error: Failed to create temp filename for '%s': %s\n", dstpath, strerror(errno));
+		free(tmppath);
+		afc_file_close(afc, fh);
 		return 0;
 	}
+	FILE *f = fopen(tmppath, "wb");
+#else
+	int tmpfd = mkstemp(tmppath);
+	FILE *f = (tmpfd >= 0) ? fdopen(tmpfd, "wb") : NULL;
+#endif
+	if (!f) {
+		printf("Error: Failed to open temp file '%s': %s\n", tmppath, strerror(errno));
+		free(tmppath);
+		afc_file_close(afc, fh);
+		return 0;
+	}
+
 	struct timeval t1;
 	struct timeval t2;
 	struct timeval tdiff;
@@ -774,6 +800,16 @@ static uint8_t get_single_file(afc_client_t afc, const char *srcpath, const char
 	free(buf);
 	fclose(f);
 	afc_file_close(afc, fh);
+	if (succeed) {
+		if (rename(tmppath, dstpath) != 0) {
+			printf("Error: Failed to rename temp file to '%s': %s\n", dstpath, strerror(errno));
+			succeed = 0;
+		}
+	}
+	if (!succeed) {
+		remove(tmppath);
+	}
+	free(tmppath);
 	return succeed;
 }
 
