@@ -1142,8 +1142,10 @@ static void rsync_recursive(afc_client_t afc, const char *remote_path, const cha
 		int local_exists = (lstat(local_path, &local_st) == 0);
 #ifdef _WIN32
 		time_t local_mtime = local_exists ? local_st.st_mtime : 0;
-#else
+#elif defined(__APPLE__)
 		time_t local_mtime = local_exists ? local_st.st_mtimespec.tv_sec : 0;
+#else
+		time_t local_mtime = local_exists ? local_st.st_mtim.tv_sec : 0;
 #endif
 		if (local_exists && local_mtime >= (time_t)remote_st.st_mtime &&
 		    (uint64_t)local_st.st_size == remote_st.st_size) {
